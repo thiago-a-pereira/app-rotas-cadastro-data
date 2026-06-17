@@ -1,0 +1,3 @@
+# Bundles e indices sao publicados como assets de Release, nao versionados no git.
+*.json
+*.json.gz
