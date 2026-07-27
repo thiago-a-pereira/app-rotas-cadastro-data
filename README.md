@@ -14,8 +14,48 @@ ferramentas de geração em `tools/`.
 | `v1-geocode` | `goiania_geocode_v1.json.gz`, `aparecida_geocode_v1.json.gz` | Índice bairro → quadra → lote → `[lat, lng]` |
 | `v2-goiania` | `goiania_lotes_v2.json.gz` | Lotes de Goiânia **com a quadra (`q`) embutida em cada lote** |
 | `v2-aparecida` | `aparecida_lotes_v2.json.gz` | Lotes de Aparecida **com a quadra (`q`) embutida em cada lote** |
+| `v1-bage` | `bage_quadras_v1.json.gz`, `bage_lotes_v1.json.gz` | Quadras/lotes de Bagé/RS (dados brutos AddressForAll, ver abaixo) |
 
 As quadras continuam em `v1-*` (não mudaram). Só os **lotes** ganharam versão v2.
+
+## Municípios novos (além de Goiânia/Aparecida)
+
+O FeatureServer ArcGIS ao vivo da AddressForAll dá **499 Token Required** em
+todo o catálogo (confirmado 24-27/07/2026, inclusive nas 3 cidades que já
+estavam configuradas no app pelo FeatureServer — Sorocaba/Atibaia/Recife).
+O caminho que funciona é baixar os dados BRUTOS doados
+(github.com/digital-guard/preserv-BR) e converter, mesmo padrão do que já era
+feito manualmente para Aparecida/Goiânia.
+
+`tools/build_municipal_bundle.js` automatiza isso:
+
+1. Acha a pasta do pack em `data/{UF}/{Cidade}/` no preserv-BR (GitHub).
+2. Lê `make_conf.yaml` dessa pasta — lista os arquivos brutos por sha256
+   (baixáveis direto em `https://dl.digital-guard.org/{sha256}.zip`) e qual
+   arquivo (`file: N`) é quadra (`layers.block`) ou lote (`layers.parcel`).
+3. Baixa o zip, extrai o GeoJSON, lê o CRS de origem (`crs.properties.name`
+   no próprio arquivo — não precisa adivinhar zona UTM) e resolve a projeção
+   via `epsg.io/{code}.proj4`.
+4. Reprojeta pra Web Mercator (3857) e grava no mesmo formato v1 usado por
+   Goiânia/Aparecida.
+
+**Não há padrão fixo de nome de propriedade pro rótulo do lote/quadra** —
+cada prefeitura digitalizou do seu jeito (ex.: Bagé usa `numero`/`baiqd`,
+Aparecida usava um campo `SUP` tipo "Q.5, LT.10"). Por isso a config de cada
+cidade (`configs/*.json`) precisa ser escrita depois de inspecionar uma
+amostra real do GeoJSON baixado (`zipFileIndex` vem de `make_conf.yaml`,
+`labelField` vem da inspeção manual).
+
+```sh
+node tools/build_municipal_bundle.js configs/bage.json
+# gera bage_quadras_v1.json.gz e bage_lotes_v1.json.gz no diretório atual;
+# depois: criar Release `v1-<slug>` no GitHub e subir os 2 arquivos como assets.
+```
+
+Cidade nova no app = (1) rodar o script, (2) publicar o Release, (3)
+registrar em `_municipalCadastreConfigs` (`arcgis_native_route_map.dart`) +
+preset em `arcgisKnownBrazilOperationalLayerPresets`
+(`arcgis_operational_layers.dart`) no app-rotas.
 
 ## Formatos
 

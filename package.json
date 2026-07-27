@@ -1,0 +1,25 @@
+{
+  "name": "app-rotas-cadastro-data",
+  "version": "1.0.0",
+  "description": "Dados de cadastro municipal (quadras e lotes) e índices de geocodificação usados pelo app **app-rotas**. Os arquivos pesados são publicados como **assets de Release** (não versionados no git); este repositório guarda apenas as ferramentas de geração em `tools/`.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thiago-a-pereira/app-rotas-cadastro-data.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/thiago-a-pereira/app-rotas-cadastro-data/issues"
+  },
+  "homepage": "https://github.com/thiago-a-pereira/app-rotas-cadastro-data#readme",
+  "dependencies": {
+    "adm-zip": "^0.6.0",
+    "proj4": "^2.20.9"
+  }
+}
