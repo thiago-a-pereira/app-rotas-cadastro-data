@@ -20,6 +20,7 @@
   "homepage": "https://github.com/thiago-a-pereira/app-rotas-cadastro-data#readme",
   "dependencies": {
     "adm-zip": "^0.6.0",
-    "proj4": "^2.20.9"
+    "proj4": "^2.20.9",
+    "shapefile": "^0.6.6"
   }
 }

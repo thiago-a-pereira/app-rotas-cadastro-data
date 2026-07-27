@@ -1,37 +1,42 @@
-// Gera bundles de quadras/lotes (mesmo formato v1 dos presets locais: ver
-// README.md) para um município a partir dos dados brutos publicados pela
-// AddressForAll/digital-guard em https://github.com/digital-guard/preserv-BR.
+// Gera bundles de quadras/lotes (mesmo formato v1: ver README.md) para um
+// município a partir dos dados brutos publicados pela AddressForAll/
+// digital-guard em https://github.com/digital-guard/preserv-BR.
 //
 // Achado (2026-07-27): cada município tem uma pasta data/{UF}/{Cidade}/_pk{donor}.{pack}
 // com um make_conf.yaml listando os arquivos brutos (nome = sha256, baixável
-// direto em https://dl.digital-guard.org/{sha256}.zip) e o srid de origem no
-// próprio GeoJSON (campo crs.properties.name). Não há padrão fixo de nomes de
-// propriedade por município (cada prefeitura digitalizou do seu jeito) — por
-// isso o field de rótulo do lote/quadra é passado explicitamente na config,
-// depois de inspecionar uma amostra do GeoJSON bruto.
+// direto em https://dl.digital-guard.org/{sha256}.{zip|rar}), o srid de
+// origem (codec:descr_encode OU srid_proj, formato varia por cidade) e, por
+// camada (parcel/block), o `file` e `method` (geojson2sql ou shp2sql — a
+// maioria das cidades é shapefile bruto, só Bagé/RJ vieram como GeoJSON
+// pronto; alguns arquivos são .rar em vez de .zip, ex. Manaus). Este script
+// lê o make_conf.yaml automaticamente — só pede o campo de rótulo do lote/
+// quadra por cidade (não tem nome de propriedade padrão entre municípios,
+// inspecionar com `node tools/inspect_layer.js` antes).
+//
+// Métodos NÃO suportados ainda (pula com aviso): gdb2sql (File Geodatabase),
+// ogr2ogr de formatos exóticos (dxf/gpkg).
 //
 // Uso:
-//   node tools/build_municipal_bundle.js configs/bage.json
+//   node tools/build_municipal_bundle.js configs/<slug>.json
 //
-// A config tem o formato:
+// Config:
 // {
-//   "citySlug": "bage",        // usado no nome dos arquivos de saída
-//   "cityLabel": "Bagé/RS",    // valor do campo "city" no bundle
-//   "uf": "RS", "cityFolder": "Bage",  // data/{uf}/{cityFolder} no preserv-BR
-//   "packFolder": "_pk0082.01",         // opcional; se omitido, autodetecta (1a pasta)
-//   "quarteirao": { "zipFileIndex": 3, "geojsonName": "QUARTEIRAO", "labelField": "baiqd" },
-//   "lote": { "zipFileIndex": 2, "geojsonName": "LOTES_URBANOS", "labelField": "numero" }
+//   "citySlug": "toledo", "cityLabel": "Toledo/PR",
+//   "uf": "PR", "cityFolder": "Toledo",
+//   "packFolder": "_pk0079.01",   // opcional; autodetecta (1a pasta) se omitido
+//   "quarteiraoLabelField": null,  // null = sem rótulo (só contorno)
+//   "loteLabelField": "numero"
 // }
-// (zipFileIndex é o `file:` do layers.block/layers.parcel no make_conf.yaml —
-// 1-based, corresponde à ordem em `files:`.)
 
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const AdmZip = require('adm-zip');
 const proj4 = require('proj4');
+const shapefile = require('shapefile');
+const { extractArchiveToTempDir, findFile, parseMakeConf } = require('./archive_utils');
 
 const CACHE_DIR = path.join(__dirname, '..', '.cache');
+const ZIP_CACHE_DIR = path.join(CACHE_DIR, 'zips');
 const proj4DefCache = new Map();
 
 async function fetchJson(url) {
@@ -39,13 +44,11 @@ async function fetchJson(url) {
   if (!res.ok) throw new Error(`HTTP ${res.status} ao buscar ${url}`);
   return res.json();
 }
-
 async function fetchText(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} ao buscar ${url}`);
   return res.text();
 }
-
 async function downloadBuffer(url) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} ao baixar ${url}`);
@@ -53,58 +56,28 @@ async function downloadBuffer(url) {
 }
 
 async function findPackFolder(uf, cityFolder) {
-  const listing = await fetchJson(
-    `https://api.github.com/repos/digital-guard/preserv-BR/contents/data/${uf}/${cityFolder}`,
-  );
+  const cityPath = cityFolder ? `${uf}/${cityFolder}` : uf;
+  const listing = await fetchJson(`https://api.github.com/repos/digital-guard/preserv-BR/contents/data/${cityPath}`);
   const dirs = listing.filter((e) => e.type === 'dir');
-  if (dirs.length === 0) throw new Error(`Nenhuma pasta de pack em data/${uf}/${cityFolder}`);
-  if (dirs.length > 1) {
-    console.warn(
-      `[aviso] ${uf}/${cityFolder} tem ${dirs.length} packs (${dirs.map((d) => d.name).join(', ')}); usando a 1a. Verifique make_conf.yaml das outras se faltar layer.`,
-    );
-  }
+  if (dirs.length === 0) throw new Error(`Nenhuma pasta de pack em data/${cityPath}`);
   return dirs[0].name;
 }
 
-// Parser mínimo do make_conf.yaml (estrutura fixa e simples: não é YAML geral).
-function parseMakeConf(yamlText) {
-  const files = [];
-  const fileBlockRe = /-\s*file:\s*(\S+)[\s\S]*?(?=\n-\s*file:|\nlicense_evidences:|\nlayers:|$)/g;
-  let m;
-  while ((m = fileBlockRe.exec(yamlText))) {
-    const block = m[0];
-    const file = m[1];
-    const name = /name:\s*(.+)/.exec(block)?.[1]?.trim();
-    const p = /p:\s*(\d+)/.exec(block)?.[1];
-    files.push({ file, name, p: p ? Number(p) : null });
-  }
-  return { files, raw: yamlText };
-}
-
-function findFileForIndex(parsed, index) {
-  const found = parsed.files.find((f) => f.p === index);
-  if (!found) {
-    throw new Error(
-      `Nenhum arquivo com p=${index} em make_conf.yaml (arquivos: ${JSON.stringify(parsed.files)})`,
-    );
-  }
-  return found;
-}
-
 async function proj4StringForEpsg(epsgCode) {
-  if (epsgCode === 4326 || epsgCode === 4674 || epsgCode === 'CRS84') {
-    return 'EPSG:4326';
-  }
-  if (proj4DefCache.has(epsgCode)) return proj4DefCache.get(epsgCode);
+  if (epsgCode === 4326 || epsgCode === 4674 || epsgCode === 'CRS84') return 'EPSG:4326';
+  const key = `EPSG:${epsgCode}`;
+  if (proj4DefCache.has(key)) return key;
   const def = await fetchText(`https://epsg.io/${epsgCode}.proj4`);
-  const trimmed = def.trim();
-  proj4.defs(`EPSG:${epsgCode}`, trimmed);
-  proj4DefCache.set(epsgCode, `EPSG:${epsgCode}`);
-  return `EPSG:${epsgCode}`;
+  proj4.defs(key, def.trim());
+  proj4DefCache.set(key, key);
+  return key;
 }
+
+const WEBMERCATOR =
+  '+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs';
+const CUSTOM_PROJ_KEY = 'CUSTOM_SOURCE';
 
 function epsgFromCrsName(crsName) {
-  // "urn:ogc:def:crs:EPSG::31981" ou "urn:ogc:def:crs:OGC:1.3:CRS84"
   if (!crsName) return 4326;
   if (crsName.includes('CRS84')) return 4326;
   const m = /EPSG::?(\d+)/.exec(crsName);
@@ -112,10 +85,8 @@ function epsgFromCrsName(crsName) {
   throw new Error(`CRS não reconhecido: ${crsName}`);
 }
 
-const WEBMERCATOR =
-  '+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs';
-
 function ringsFromGeometry(geometry, transform) {
+  if (!geometry) return null;
   const polys =
     geometry.type === 'Polygon'
       ? [geometry.coordinates]
@@ -132,51 +103,85 @@ function ringsFromGeometry(geometry, transform) {
   return rings;
 }
 
-async function extractGeojson(zipBuffer, geojsonName) {
-  const zip = new AdmZip(zipBuffer);
-  const entry = zip
-    .getEntries()
-    .find((e) => e.entryName.toLowerCase() === `${geojsonName.toLowerCase()}.geojson`);
-  if (!entry) {
-    throw new Error(
-      `${geojsonName}.geojson não encontrado no zip (entradas: ${zip
-        .getEntries()
-        .map((e) => e.entryName)
-        .join(', ')})`,
-    );
+async function downloadZipCached(sha256File, label) {
+  fs.mkdirSync(ZIP_CACHE_DIR, { recursive: true });
+  const cachePath = path.join(ZIP_CACHE_DIR, sha256File);
+  if (fs.existsSync(cachePath)) return fs.readFileSync(cachePath);
+  console.log(`  baixando ${label}: ${sha256File}`);
+  const buf = await downloadBuffer(`https://dl.digital-guard.org/${sha256File}`);
+  fs.writeFileSync(cachePath, buf);
+  return buf;
+}
+
+/// Extrai features (GeoJSON-like: {properties, geometry}) de um archive,
+/// seja GeoJSON pronto (method geojson2sql) ou shapefile bruto (shp2sql).
+async function extractFeatures(archiveBuffer, archiveFileName, layerDef) {
+  const { tmpDir, files } = extractArchiveToTempDir(archiveBuffer, archiveFileName);
+  try {
+    if (layerDef.method === 'geojson2sql') {
+      const found = findFile(files, layerDef.origFilename, '.geojson');
+      if (!found) throw new Error(`.geojson não achado pra "${layerDef.origFilename}" (${files.length} arquivos no archive)`);
+      const geojson = JSON.parse(fs.readFileSync(found, 'utf8'));
+      const epsg = epsgFromCrsName(geojson.crs?.properties?.name);
+      return { features: geojson.features, epsg };
+    }
+    if (layerDef.method === 'shp2sql') {
+      const shpPath = findFile(files, layerDef.origFilename, '.shp');
+      if (!shpPath) throw new Error(`.shp não achado pra "${layerDef.origFilename}" (${files.length} arquivos no archive)`);
+      const base = shpPath.slice(0, -4).toLowerCase();
+      const dbfPath = files.find((f) => f.toLowerCase() === base + '.dbf');
+      const cpgPath = files.find((f) => f.toLowerCase() === base + '.cpg');
+      // DBF antigo (a maioria dos shapefiles municipais brasileiros pré-2020)
+      // não é UTF-8 — sem o .cpg (poucas cidades têm), acentos viram mojibake.
+      // Bagé tinha .cpg="UTF-8" e funcionou; o default seguro pra quem não
+      // declara é latin1 (western europe / ISO-8859-1), o mais comum nesses
+      // dados.
+      let encoding = 'latin1';
+      if (cpgPath) {
+        const cpg = fs.readFileSync(cpgPath, 'utf8').trim().toUpperCase();
+        if (cpg.includes('UTF-8') || cpg.includes('UTF8')) encoding = 'utf8';
+      }
+      // Buffers, não paths: a lib `shapefile` decide se já tem a extensão
+      // ".dbf" com uma regex case-SENSITIVE (`/\.dbf$/`) — arquivo extraído
+      // com ".DBF" maiúsculo (ex.: Vila Velha) engana o teste e ela concatena
+      // ".dbf" de novo, quebrando o path. Passar os bytes já lidos evita essa
+      // lógica de sufixo por completo.
+      const shpBuffer = fs.readFileSync(shpPath);
+      const dbfBuffer = dbfPath ? fs.readFileSync(dbfPath) : undefined;
+      const source = await shapefile.open(shpBuffer, dbfBuffer, { encoding });
+      const features = [];
+      let result;
+      while (!(result = await source.read()).done) features.push(result.value);
+      return { features, epsg: null }; // resolvido pelo srid global do pack
+    }
+    throw new Error(`method não suportado: ${layerDef.method}`);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
-  return JSON.parse(entry.getData().toString('utf8'));
 }
 
 function cellKeyForPoint(x, y, cellSize) {
   return `${Math.floor(x / cellSize)}:${Math.floor(y / cellSize)}`;
 }
 
-async function buildQuadrasBundle({ geojson, labelField, cityLabel, transform }) {
-  const features = [];
-  for (const f of geojson.features) {
+function buildQuadrasBundle({ features, labelField, cityLabel, transform }) {
+  const out = [];
+  for (const f of features) {
     const rings = ringsFromGeometry(f.geometry, transform);
     if (!rings || rings.length === 0) continue;
-    const q = `${f.properties?.[labelField] ?? ''}`.trim();
-    features.push({ q, g: { rings } });
+    const q = labelField ? `${f.properties?.[labelField] ?? ''}`.trim() : '';
+    out.push({ q, g: { rings } });
   }
-  return {
-    version: 1,
-    wkid: 3857,
-    city: cityLabel,
-    count: features.length,
-    features,
-  };
+  return { version: 1, wkid: 3857, city: cityLabel, count: out.length, features: out };
 }
 
-async function buildLotesBundle({ geojson, labelField, cityLabel, transform, cellSize = 480 }) {
+function buildLotesBundle({ features, labelField, cityLabel, transform, cellSize = 480 }) {
   const cells = {};
   let count = 0;
-  for (const f of geojson.features) {
+  for (const f of features) {
     const rings = ringsFromGeometry(f.geometry, transform);
     if (!rings || rings.length === 0) continue;
-    const n = `${f.properties?.[labelField] ?? ''}`.trim();
-    // Centroide simples (média dos vértices do 1o ring) só para indexar a célula.
+    const n = labelField ? `${f.properties?.[labelField] ?? ''}`.trim() : '';
     const outer = rings[0];
     let sx = 0;
     let sy = 0;
@@ -190,75 +195,91 @@ async function buildLotesBundle({ geojson, labelField, cityLabel, transform, cel
     (cells[key] ??= []).push({ n, g: { rings } });
     count++;
   }
-  return {
-    version: 1,
-    wkid: 3857,
-    cellSize,
-    city: cityLabel,
-    count,
-    cellCount: Object.keys(cells).length,
-    cells,
-  };
+  return { version: 1, wkid: 3857, cellSize, city: cityLabel, count, cellCount: Object.keys(cells).length, cells };
+}
+
+// Sanity check: um ponto de amostra deve cair dentro do Brasil continental.
+function assertInsideBrazil(rings, citySlug, kind) {
+  const [x, y] = rings[0][0];
+  const lon = (x / 20037508.34) * 180;
+  const lat = (Math.atan(Math.exp((y / 20037508.34) * Math.PI)) * 360) / Math.PI - 90;
+  if (lon < -74 || lon > -34 || lat < -34 || lat > 6) {
+    throw new Error(
+      `${citySlug} ${kind}: ponto de amostra fora do Brasil (lon=${lon.toFixed(2)}, lat=${lat.toFixed(2)}) — CRS errado?`,
+    );
+  }
 }
 
 async function run(configPath) {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-  const packFolder =
-    config.packFolder || (await findPackFolder(config.uf, config.cityFolder));
-  const baseUrl = `https://raw.githubusercontent.com/digital-guard/preserv-BR/main/data/${config.uf}/${config.cityFolder}/${packFolder}`;
+  const packFolder = config.packFolder || (await findPackFolder(config.uf, config.cityFolder));
+  const cityPath = config.cityFolder ? `${config.uf}/${config.cityFolder}` : config.uf;
+  const baseUrl = `https://raw.githubusercontent.com/digital-guard/preserv-BR/main/data/${cityPath}/${packFolder}`;
   console.log(`[${config.citySlug}] pack: ${packFolder}`);
   const yamlText = await fetchText(`${baseUrl}/make_conf.yaml`);
   const parsed = parseMakeConf(yamlText);
 
-  const outputs = {};
+  if (parsed.sridProj) {
+    proj4.defs(CUSTOM_PROJ_KEY, parsed.sridProj);
+  }
 
-  for (const [kind, spec] of [
-    ['quarteirao', config.quarteirao],
-    ['lote', config.lote],
-  ]) {
-    if (!spec) continue;
-    const fileEntry = findFileForIndex(parsed, spec.zipFileIndex);
-    const cacheZipPath = path.join(CACHE_DIR, `${fileEntry.file}`);
-    let zipBuffer;
-    if (fs.existsSync(cacheZipPath)) {
-      zipBuffer = fs.readFileSync(cacheZipPath);
-    } else {
-      console.log(`[${config.citySlug}] baixando ${kind}: ${fileEntry.file} (${fileEntry.name})`);
-      zipBuffer = await downloadBuffer(`https://dl.digital-guard.org/${fileEntry.file}`);
-      fs.writeFileSync(cacheZipPath, zipBuffer);
+  const outputs = {};
+  const layerSpecs = [
+    ['quarteirao', 'block', config.quarteiraoLabelField],
+    ['lote', 'parcel', config.loteLabelField],
+  ];
+
+  for (const [kind, layerKey, labelField] of layerSpecs) {
+    const layerDef = parsed.layers[layerKey];
+    if (!layerDef) {
+      console.log(`[${config.citySlug}] ${kind}: sem layer ${layerKey} no make_conf.yaml, pulando.`);
+      continue;
     }
-    const geojson = await extractGeojson(zipBuffer, spec.geojsonName);
-    const epsg = epsgFromCrsName(geojson.crs?.properties?.name);
-    const projKey = await proj4StringForEpsg(epsg);
+    // Override manual do orig_filename: alguma cidades declaram o
+    // orig_filename como lista (ex.: Joinville "['a','b']", urbano+rural
+    // combinados) — o parser não separa isso, então a config da cidade pode
+    // apontar pro arquivo único que interessa.
+    const origFilenameOverrideKey = kind === 'quarteirao' ? 'quarteiraoOrigFilename' : 'loteOrigFilename';
+    if (config[origFilenameOverrideKey]) {
+      layerDef.origFilename = config[origFilenameOverrideKey];
+    }
+    if (layerDef.method !== 'geojson2sql' && layerDef.method !== 'shp2sql') {
+      console.warn(`[${config.citySlug}] ${kind}: method "${layerDef.method}" não suportado ainda — pulando.`);
+      continue;
+    }
+    const fileEntry = parsed.files.find((f) => f.p === layerDef.file);
+    if (!fileEntry) throw new Error(`Nenhum arquivo com p=${layerDef.file} em make_conf.yaml`);
+    const archiveBuffer = await downloadZipCached(fileEntry.file, `${kind} (${layerDef.origFilename})`);
+    const { features, epsg: geojsonEpsg } = await extractFeatures(archiveBuffer, fileEntry.file, layerDef);
+    const epsg = geojsonEpsg ?? parsed.srid;
+    if (!epsg && !parsed.sridProj) {
+      throw new Error(`${config.citySlug} ${kind}: sem SRID (nem no GeoJSON, nem srid=, nem srid_proj)`);
+    }
+    const projKey = epsg ? await proj4StringForEpsg(epsg) : CUSTOM_PROJ_KEY;
     const transform =
       projKey === 'EPSG:4326'
         ? ([lon, lat]) => proj4('EPSG:4326', WEBMERCATOR, [lon, lat])
         : ([x, y]) => proj4(projKey, WEBMERCATOR, [x, y]);
     console.log(
-      `[${config.citySlug}] ${kind}: ${geojson.features.length} features, EPSG:${epsg}`,
+      `[${config.citySlug}] ${kind}: ${features.length} features, ${epsg ? `EPSG:${epsg}` : 'srid_proj'}, method=${layerDef.method}`,
     );
 
     const bundle =
       kind === 'quarteirao'
-        ? await buildQuadrasBundle({
-            geojson,
-            labelField: spec.labelField,
-            cityLabel: config.cityLabel,
-            transform,
-          })
-        : await buildLotesBundle({
-            geojson,
-            labelField: spec.labelField,
-            cityLabel: config.cityLabel,
-            transform,
-          });
+        ? buildQuadrasBundle({ features, labelField, cityLabel: config.cityLabel, transform })
+        : buildLotesBundle({ features, labelField, cityLabel: config.cityLabel, transform });
 
-    const outName =
-      kind === 'quarteirao'
-        ? `${config.citySlug}_quadras_v1.json.gz`
-        : `${config.citySlug}_lotes_v1.json.gz`;
+    if (bundle.count === 0) {
+      console.warn(`[${config.citySlug}] ${kind}: 0 features válidas, pulando output.`);
+      continue;
+    }
+    const sampleRings =
+      kind === 'quarteirao' ? bundle.features[0].g.rings : bundle.cells[Object.keys(bundle.cells)[0]][0].g.rings;
+    assertInsideBrazil(sampleRings, config.citySlug, kind);
+
+    const outName = kind === 'quarteirao' ? `${config.citySlug}_quadras_v1.json.gz` : `${config.citySlug}_lotes_v1.json.gz`;
     const gz = zlib.gzipSync(Buffer.from(JSON.stringify(bundle)), { level: 9 });
     fs.writeFileSync(path.join(__dirname, '..', outName), gz);
     outputs[kind] = { file: outName, count: bundle.count };
@@ -274,6 +295,6 @@ if (!configPath) {
   process.exit(1);
 }
 run(configPath).catch((err) => {
-  console.error(err);
+  console.error(`[erro] ${err.stack || err.message}`);
   process.exit(1);
 });
