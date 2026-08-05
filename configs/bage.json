@@ -1,0 +1,8 @@
+{
+  "citySlug": "bage",
+  "cityLabel": "Bagé/RS",
+  "uf": "RS",
+  "cityFolder": "Bage",
+  "quarteirao": { "zipFileIndex": 3, "geojsonName": "QUARTEIRAO", "labelField": "baiqd" },
+  "lote": { "zipFileIndex": 2, "geojsonName": "LOTES_URBANOS", "labelField": "numero" }
+}

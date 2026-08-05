@@ -1,0 +1,9 @@
+# Bundles e indices sao publicados como assets de Release, nao versionados no git.
+*.json
+*.json.gz
+!configs/*.json
+!package.json
+!package-lock.json
+
+node_modules/
+.cache/
